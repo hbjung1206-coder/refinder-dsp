@@ -1,0 +1,7 @@
+streamlit
+librosa
+numpy
+scipy
+pylast
+youtube-search-python
+soundfile
