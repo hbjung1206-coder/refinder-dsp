@@ -3,23 +3,50 @@ import librosa
 import numpy as np
 import scipy.signal
 import scipy.fft
+import soundfile as sf  # For Metadata Extraction
 import tempfile
 import os
 import gc
 
 # ==============================================================================
-# MODULE 1: DSP KERNEL (PHYSICS & MATH)
+# MODULE 1: DSP KERNEL
 # ==============================================================================
 
 class MasteringDSP:
     @staticmethod
     def load_audio(file_path):
         try:
+            # Librosa loads FLAC natively if soundfile is installed
             y, sr = librosa.load(file_path, sr=44100, mono=False, duration=180)
             if y.ndim == 1: y = np.stack((y, y))
             return y, sr
         except Exception as e:
             raise RuntimeError(f"Critical Load Error: {e}")
+
+    @staticmethod
+    def get_file_metadata(file_path):
+        """
+        Extracts Sample Rate and Bit Depth/Format info directly from the file header.
+        """
+        try:
+            with sf.SoundFile(file_path) as f:
+                sr = f.samplerate
+                subtype = f.subtype
+                fmt = f.format
+                
+                # Bit Depth Analysis
+                if 'PCM' in subtype:
+                    quality = f"{subtype.split('_')[-1]}-bit INT"
+                elif 'FLOAT' in subtype:
+                    quality = "32-bit FLOAT"
+                elif 'MPEG' in subtype:
+                    quality = "Lossy (MP3)" # MP3 bitrate is hard to get without specific libs, keeps it safe
+                else:
+                    quality = subtype
+                
+                return sr, quality, fmt
+        except Exception:
+            return 0, "Unknown", "Unknown"
 
     @staticmethod
     def k_weighting_filter(y, sr):
@@ -142,7 +169,7 @@ class MasteringDSP:
         return best_key
 
 # ==============================================================================
-# MODULE 2: AI ADVISER ENGINE
+# MODULE 2: AI ADVISER & MATRIX ENGINE
 # ==============================================================================
 
 class AIAdviser:
@@ -150,47 +177,72 @@ class AIAdviser:
     def generate_report(data):
         advice_list = []
         
-        # 1. Loudness Check
-        if data['lufs'] < -15:
-            advice_list.append(("WARN", "Low Loudness", "스트리밍 표준(-14 LUFS)보다 소리가 작습니다. 리미터나 맥시마이저를 사용하여 전체 음압을 2~3dB 더 확보하세요."))
-        elif data['lufs'] > -7:
-            advice_list.append(("WARN", "Extreme Loudness", "음압이 매우 높습니다(-7 LUFS 초과). 다이내믹 레인지가 손실되었는지 확인하세요."))
+        # 1. Loudness Check (Simple)
+        if data['lufs'] > -7:
+            advice_list.append(("WARN", "High Loudness Level", "음압이 매우 높습니다(-7 LUFS 초과). 클럽/CD 마스터링 의도가 아니라면 다이내믹 레인지 손실을 체크하세요."))
         else:
-            advice_list.append(("PASS", "Healthy Loudness", "스트리밍 서비스에 최적화된 적절한 음압입니다."))
-
-        # 2. True Peak Check
-        if data['true_peak'] > -0.5:
-            advice_list.append(("CRIT", "True Peak Clipping Risk", f"True Peak가 {data['true_peak']}dBTP 입니다. 인코딩 시 클리핑 방지를 위해 리미터 Ceiling을 -1.0dBTP로 낮추세요."))
-        else:
-            advice_list.append(("PASS", "Safe Headroom", "디지털 클리핑으로부터 안전한 헤드룸을 확보했습니다."))
+            advice_list.append(("PASS", "Safe Loudness Range", "다이내믹 레인지가 보존된 안전한 음압 범위 내에 있습니다."))
 
         # 3. Stereo Phase Check
         if data['corr'] < 0.2:
-            advice_list.append(("CRIT", "Phase Cancellation", "위상 상관도(Correlation)가 위험 수준입니다. 모노 호환성을 점검하고 이미저 사용을 줄이세요."))
+            advice_list.append(("CRIT", "Phase Cancellation Risk", "위상 상관도가 낮아 모노 호환성에 문제가 발생할 수 있습니다. 저음역대(Kick/Bass)의 모노 센터링을 확인하세요."))
         elif data['corr'] < 0.6:
-            advice_list.append(("INFO", "Wide Stereo Image", "스테레오 이미지가 넓은 편입니다. 베이스/킥이 모노 중앙에 잘 위치하는지 확인하세요."))
+            advice_list.append(("INFO", "Wide Stereo Image", "넓은 스테레오 이미지를 가지고 있습니다. 의도된 공간감인지, 위상 간섭인지 확인이 필요합니다."))
         else:
-            advice_list.append(("PASS", "Solid Phase", "위상 호환성이 좋으며 단단한 믹스입니다."))
+            advice_list.append(("PASS", "Solid Phase Coherence", "위상 호환성이 좋으며 단단한 믹스 밸런스를 유지하고 있습니다."))
 
         # 4. Frequency Balance Check
         sub_energy = data['freq']['SUB']
         air_energy = data['freq']['AIR']
         
         if sub_energy > 25:
-            advice_list.append(("WARN", "Excessive Sub-Bass", f"서브 베이스 에너지가 {int(sub_energy)}%로 높습니다. 부밍(Booming)을 주의하세요."))
+            advice_list.append(("WARN", "Excessive Low-End", f"SUB 대역 에너지가 {int(sub_energy)}%로 높습니다. 불필요한 초저역 부밍(Booming)이 없는지 확인하세요."))
         elif sub_energy < 5:
-            advice_list.append(("WARN", "Lack of Low-End", "저음역 에너지가 부족하여 믹스가 가볍게 들릴 수 있습니다."))
+            advice_list.append(("WARN", "Lack of Low-End", "저음역 에너지가 부족합니다. 믹스가 전체적으로 가볍게 들릴 수 있습니다."))
             
         if air_energy > 15:
-            advice_list.append(("WARN", "Harsh High-End", f"고음역 에너지가 {int(air_energy)}%로 높습니다. 치찰음(Sibilance)을 체크하세요."))
+            advice_list.append(("WARN", "Bright High-End", f"AIR 대역 에너지가 {int(air_energy)}%로 높습니다. 보컬의 치찰음이나 심벌의 자극적인 대역을 디에서로 제어하세요."))
 
         return advice_list
+
+    @staticmethod
+    def generate_matrix(data):
+        # 1. DYNAMICS (PLR)
+        if data['plr'] < 8: d_val = "COMPRESSED"
+        elif data['plr'] > 14: d_val = "DYNAMIC"
+        else: d_val = "BALANCED"
+
+        # 2. TONE (Spectral)
+        sub = data['freq']['SUB']
+        air = data['freq']['AIR']
+        if sub > 25: t_val = "BOOMY / DEEP"
+        elif air > 15: t_val = "BRIGHT / AIRY"
+        elif sub < 10 and air < 8: t_val = "MID-FOCUSED"
+        else: t_val = "NEUTRAL"
+
+        # 3. IMAGE
+        corr = data['corr']
+        if corr < 0.3: i_val = "PHASE ISSUE"
+        elif corr < 0.6: i_val = "WIDE"
+        else: i_val = "CENTERED"
+        
+        # 4. LOUDNESS
+        lufs = data['lufs']
+        if lufs > -9: l_val = "LOUD / CD"
+        elif lufs < -16: l_val = "GENTLE"
+        else: l_val = "STREAMING"
+        
+        return d_val, t_val, i_val, l_val
 
 # ==============================================================================
 # MODULE 3: PIPELINE
 # ==============================================================================
 
 def run_analysis_pipeline(file_path):
+    # Extract Metadata First
+    meta_sr, meta_quality, meta_fmt = MasteringDSP.get_file_metadata(file_path)
+    
+    # Load for DSP
     y, sr = MasteringDSP.load_audio(file_path)
     
     try:
@@ -204,18 +256,21 @@ def run_analysis_pipeline(file_path):
             "lufs": lufs, "true_peak": true_peak, "plr": plr,
             "corr": corr, "width": width,
             "freq": freq_dist,
-            "bpm": bpm, "groove": groove, "key": key
+            "bpm": bpm, "groove": groove, "key": key,
+            "meta": {"sr": meta_sr, "quality": meta_quality, "fmt": meta_fmt}
         }
         
         report = AIAdviser.generate_report(data)
-        return data, report
+        matrix = AIAdviser.generate_matrix(data)
+        
+        return data, report, matrix
         
     finally:
         del y
         gc.collect()
 
 # ==============================================================================
-# MODULE 4: DASHBOARD UI (VISUAL UPGRADE)
+# MODULE 4: DASHBOARD UI
 # ==============================================================================
 
 def configure_ui():
@@ -223,104 +278,59 @@ def configure_ui():
     st.markdown("""
     <style>
         @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;600;800&display=swap');
-        
-        /* ----- Global Theme ----- */
         html, body, [class*="css"] {
             font-family: 'Inter', sans-serif;
-            background: radial-gradient(circle at top left, #1a1a2e 0%, #0a0a0a 100%); /* Deep Cyberpunk Background */
+            background: radial-gradient(circle at top left, #1a1a2e 0%, #0a0a0a 100%);
             color: #E0E0E0;
         }
+        .app-title { font-size: 3.5rem; font-weight: 900; letter-spacing: -2px; color: #FFF; margin:0; text-shadow: 0 0 20px rgba(0, 188, 212, 0.3); }
+        .app-subtitle { font-family: 'JetBrains Mono'; font-size: 0.9rem; color: #00bcd4; margin-bottom: 40px; letter-spacing: 2px; text-transform: uppercase; font-weight: 700; }
         
-        /* ----- Headers ----- */
-        .app-title {
-            font-size: 3.5rem; font-weight: 900; letter-spacing: -2px; color: #FFF; margin:0;
-            text-shadow: 0 0 20px rgba(0, 188, 212, 0.3); /* Subtle Neon Glow */
-        }
-        .app-subtitle {
-            font-family: 'JetBrains Mono'; font-size: 0.9rem; color: #00bcd4; /* Cyan accent */
-            margin-bottom: 40px; letter-spacing: 2px; text-transform: uppercase; font-weight: 700;
-        }
-        
-        /* ----- Pro Panels (Glassmorphism) ----- */
         .panel {
-            background: rgba(25, 25, 35, 0.7); /* Semi-transparent */
-            backdrop-filter: blur(12px); /* Frost Effect */
-            border: 1px solid rgba(255, 255, 255, 0.08);
-            border-radius: 12px;
-            padding: 25px;
-            margin-bottom: 20px;
-            height: 100%;
-            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3); /* Deep Shadow */
-            transition: all 0.3s ease;
+            background: rgba(25, 25, 35, 0.7); backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 12px; padding: 25px; margin-bottom: 20px; height: 100%;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3); transition: all 0.3s ease;
         }
-        .panel:hover {
-            border-color: rgba(0, 188, 212, 0.4); /* Cyan hover glow */
-            box-shadow: 0 15px 40px rgba(0, 188, 212, 0.1);
-            transform: translateY(-3px);
-        }
-        .panel-header {
-            font-family: 'JetBrains Mono'; font-size: 0.8rem; color: #888;
-            text-transform: uppercase; border-bottom: 1px solid rgba(255,255,255,0.1);
-            padding-bottom: 10px; margin-bottom: 20px; letter-spacing: 1px; font-weight: 600;
-        }
+        .panel:hover { border-color: rgba(0, 188, 212, 0.4); box-shadow: 0 15px 40px rgba(0, 188, 212, 0.1); transform: translateY(-3px); }
+        .panel-header { font-family: 'JetBrains Mono'; font-size: 0.8rem; color: #888; text-transform: uppercase; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 10px; margin-bottom: 20px; letter-spacing: 1px; font-weight: 600; }
         
-        /* ----- Metrics (Glowing Numbers) ----- */
-        .big-val {
-            font-size: 3.2rem; font-weight: 900; color: #FFF; line-height: 1; letter-spacing: -1.5px;
-            text-shadow: 0 0 10px rgba(255, 255, 255, 0.2);
-        }
+        .big-val { font-size: 3.2rem; font-weight: 900; color: #FFF; line-height: 1; letter-spacing: -1.5px; text-shadow: 0 0 10px rgba(255, 255, 255, 0.2); }
         .unit { font-size: 1.1rem; color: #666; font-weight: 500; margin-left: 5px; }
-        .sub-metric {
-            font-family: 'JetBrains Mono'; font-size: 0.85rem; color: #AAA; margin-top: 10px;
-            display: flex; align-items: center;
-        }
-        .sub-metric i { margin-right: 8px; color: #00bcd4; } /* Icon accent */
+        .sub-metric { font-family: 'JetBrains Mono'; font-size: 0.85rem; color: #AAA; margin-top: 10px; display: flex; align-items: center; }
         
-        /* ----- Visualizers (Neon Bars) ----- */
+        /* Tech Specs */
+        .specs-bar { display: flex; justify-content: space-between; align-items: center; background: rgba(0, 188, 212, 0.1); border: 1px solid rgba(0, 188, 212, 0.3); border-radius: 8px; padding: 12px 20px; margin-bottom: 20px; font-family: 'JetBrains Mono'; color: #00bcd4; }
+        .specs-label { font-weight: 700; margin-right: 10px; }
+        .specs-val { color: #FFF; margin-right: 20px; }
+        
+        /* Spectrum */
         .freq-row { display: flex; align-items: center; margin-bottom: 12px; font-family: 'JetBrains Mono'; font-size: 0.8rem; }
         .freq-label { width: 65px; color: #888; font-weight: 600; }
-        .freq-bar-bg {
-            flex-grow: 1; height: 10px; background: rgba(0, 0, 0, 0.3);
-            border-radius: 5px; overflow: hidden; margin: 0 15px;
-            box-shadow: inset 0 2px 5px rgba(0,0,0,0.5);
-        }
-        .freq-bar-fill {
-            height: 100%; border-radius: 5px;
-            /* Cyan to Purple Gradient */
-            background: linear-gradient(90deg, #00bcd4, #7b1fa2);
-            box-shadow: 0 0 15px rgba(0, 188, 212, 0.6); /* Neon Glow */
-            transition: width 0.6s cubic-bezier(0.25, 0.8, 0.25, 1); /* Smooth spring animation */
-        }
+        .freq-bar-bg { flex-grow: 1; height: 10px; background: rgba(0, 0, 0, 0.3); border-radius: 5px; overflow: hidden; margin: 0 15px; box-shadow: inset 0 2px 5px rgba(0,0,0,0.5); }
+        .freq-bar-fill { height: 100%; border-radius: 5px; background: linear-gradient(90deg, #00bcd4, #7b1fa2); box-shadow: 0 0 15px rgba(0, 188, 212, 0.6); transition: width 0.6s ease; }
         .freq-val { width: 45px; text-align: right; color: #FFF; font-weight: 700; }
         
-        /* ----- AI Report Cards (Sleek) ----- */
-        .report-card {
-            background: rgba(30, 30, 40, 0.6); border-left: 4px solid #555;
-            padding: 15px; margin-bottom: 10px; border-radius: 8px;
-            backdrop-filter: blur(5px);
-        }
+        /* Report Cards */
+        .report-card { background: rgba(30, 30, 40, 0.6); border-left: 4px solid #555; padding: 15px; margin-bottom: 10px; border-radius: 8px; backdrop-filter: blur(5px); }
         .report-PASS { border-left-color: #00e676; background: linear-gradient(90deg, rgba(0,230,118,0.1), transparent); }
         .report-WARN { border-left-color: #ffea00; background: linear-gradient(90deg, rgba(255,234,0,0.1), transparent); }
         .report-CRIT { border-left-color: #ff1744; background: linear-gradient(90deg, rgba(255,23,68,0.1), transparent); }
         .report-INFO { border-left-color: #2979ff; background: linear-gradient(90deg, rgba(41,121,255,0.1), transparent); }
-        
         .report-title { font-weight: 800; color: #FFF; font-size: 0.95rem; margin-bottom: 6px; display: flex; align-items: center; }
         .report-msg { font-size: 0.9rem; color: #CCC; line-height: 1.5; }
         .status-icon { margin-right: 10px; font-size: 1.2rem; }
         
-        /* ----- Components ----- */
-        div.stButton > button {
-            background: linear-gradient(45deg, #00bcd4, #0097a7); /* Gradient Button */
-            color: #FFF; width: 100%; border: none; padding: 18px;
-            font-weight: 800; border-radius: 8px; font-family: 'JetBrains Mono'; letter-spacing: 1px;
-            box-shadow: 0 5px 20px rgba(0, 188, 212, 0.3);
-            transition: all 0.3s ease;
-        }
-        div.stButton > button:hover {
-            box-shadow: 0 8px 25px rgba(0, 188, 212, 0.5);
-            transform: translateY(-2px);
-        }
-        .stFileUploader label { font-family: 'JetBrains Mono'; font-weight: 600; color: #00bcd4; }
+        /* Matrix Box */
+        .matrix-box { text-align: center; padding: 15px 10px; border-radius: 8px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.05); }
+        .matrix-label { font-family: 'JetBrains Mono'; font-size: 0.75rem; color: #00bcd4; margin-bottom: 8px; letter-spacing: 1px; font-weight: 700; }
+        .matrix-val { font-size: 1.2rem; font-weight: 900; color: #FFF; margin-bottom: 6px; }
+        .matrix-sub { font-size: 0.7rem; color: #666; font-family: 'JetBrains Mono'; font-style: italic; }
+        
+        /* Disclaimer */
+        .disclaimer { font-family: 'Inter', sans-serif; font-size: 0.8rem; color: #666; text-align: center; margin-top: 20px; border-top: 1px solid #333; padding-top: 20px; }
+
+        div.stButton > button { background: linear-gradient(45deg, #00bcd4, #0097a7); color: #FFF; width: 100%; border: none; padding: 18px; font-weight: 800; border-radius: 8px; font-family: 'JetBrains Mono'; letter-spacing: 1px; box-shadow: 0 5px 20px rgba(0, 188, 212, 0.3); transition: all 0.3s ease; }
+        div.stButton > button:hover { box-shadow: 0 8px 25px rgba(0, 188, 212, 0.5); transform: translateY(-2px); }
     </style>
     """, unsafe_allow_html=True)
 
@@ -332,7 +342,8 @@ def main():
 
     if 'last_file_id' not in st.session_state: st.session_state['last_file_id'] = None
     
-    uploaded_file = st.file_uploader("DROP AUDIO MASTER (WAV/MP3)", type=["mp3", "wav"])
+    # Updated File Uploader with FLAC
+    uploaded_file = st.file_uploader("DROP AUDIO MASTER (WAV/MP3/FLAC)", type=["mp3", "wav", "flac"])
     
     if uploaded_file:
         current_id = f"{uploaded_file.name}-{uploaded_file.size}"
@@ -341,7 +352,7 @@ def main():
             st.session_state['result'] = None
             st.rerun()
             
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_file:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp_file:
             tmp_file.write(uploaded_file.getvalue())
             tmp_path = tmp_file.name
         
@@ -352,8 +363,8 @@ def main():
             if st.button("ENGAGE ANALYSIS ENGINE"):
                 with st.spinner("PROCESSING SIGNAL CHAIN..."):
                     try:
-                        data, report = run_analysis_pipeline(tmp_path)
-                        st.session_state['result'] = {"data": data, "report": report}
+                        data, report, matrix = run_analysis_pipeline(tmp_path)
+                        st.session_state['result'] = {"data": data, "report": report, "matrix": matrix, "filename": uploaded_file.name}
                         st.rerun()
                     except Exception as e:
                         st.error(f"Error: {e}")
@@ -369,12 +380,25 @@ def main():
     if st.session_state.get('result'):
         d = st.session_state['result']['data']
         report = st.session_state['result']['report']
+        matrix = st.session_state['result']['matrix']
+        fname = st.session_state['result'].get('filename', 'Unknown Track')
         
         st.write("")
         st.markdown("---")
         st.write("")
         
-        # ROW 1: CORE METRICS (3 Columns)
+        # ROW 0: FILE TECH SPECS (NEW)
+        st.markdown(f"""
+        <div class="specs-bar">
+            <div><span class="specs-label">FILE:</span> <span class="specs-val">{fname}</span></div>
+            <div>
+                <span class="specs-label">SAMPLE RATE:</span> <span class="specs-val">{d['meta']['sr']} Hz</span>
+                <span class="specs-label">QUALITY:</span> <span class="specs-val">{d['meta']['quality']}</span>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # ROW 1: CORE METRICS
         c1, c2, c3 = st.columns([1, 1, 1])
         with c1:
             st.markdown(f"""
@@ -398,11 +422,10 @@ def main():
                 <div class="sub-metric"><i>▶</i> KEY: {d['key']}</div>
             </div>""", unsafe_allow_html=True)
             
-        # ROW 2: SPECTRUM & AI REPORT (2 Columns)
+        # ROW 2: SPECTRUM & AI REPORT
         c_spec, c_report = st.columns([1, 1])
         
         with c_spec:
-            # Frequency Spectrum Panel with Neon Bars
             st.markdown(f"""
             <div class="panel" style="height:100%">
                 <div class="panel-header">SPECTRAL BALANCE</div>
@@ -415,7 +438,6 @@ def main():
             """, unsafe_allow_html=True)
             
         with c_report:
-            # Sleek AI Report Panel
             st.markdown(f"""
             <div class="panel" style="height:100%; overflow-y: auto;">
                 <div class="panel-header">🤖 AI DIAGNOSTIC REPORT</div>
@@ -429,8 +451,53 @@ def main():
                     <div class="report-msg">{msg}</div>
                 </div>
                 """, unsafe_allow_html=True)
-            
             st.markdown("</div>", unsafe_allow_html=True)
+
+        # ROW 3: SUMMARY MATRIX & DISCLAIMER
+        st.write("")
+        st.markdown(f"""
+        <div class="panel">
+            <div class="panel-header">📌 AI FEEDBACK SUMMARY (KEY POINTS)</div>
+        """, unsafe_allow_html=True)
+        
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
+            st.markdown(f"""
+            <div class="matrix-box">
+                <div class="matrix-label">DYNAMICS</div>
+                <div class="matrix-val">{matrix[0]}</div>
+                <div class="matrix-sub">PLR: <8 (Dense) ~ >14 (Dynamic)</div>
+            </div>""", unsafe_allow_html=True)
+        with m2:
+            st.markdown(f"""
+            <div class="matrix-box">
+                <div class="matrix-label">TONAL BALANCE</div>
+                <div class="matrix-val">{matrix[1]}</div>
+                <div class="matrix-sub">Spectrum: Sub-Bass vs Air</div>
+            </div>""", unsafe_allow_html=True)
+        with m3:
+            st.markdown(f"""
+            <div class="matrix-box">
+                <div class="matrix-label">STEREO FIELD</div>
+                <div class="matrix-val">{matrix[2]}</div>
+                <div class="matrix-sub">Corr: <0.3 (Phase) ~ >0.6 (Mono)</div>
+            </div>""", unsafe_allow_html=True)
+        with m4:
+            st.markdown(f"""
+            <div class="matrix-box">
+                <div class="matrix-label">LOUDNESS TYPE</div>
+                <div class="matrix-val">{matrix[3]}</div>
+                <div class="matrix-sub">LUFS: >-9 (Loud) ~ <-16 (Gentle)</div>
+            </div>""", unsafe_allow_html=True)
+        
+        # DISCLAIMER
+        st.markdown("""
+            <div class="disclaimer">
+                Caution: AI로 측정한 수치이며, 오디오는 주관적인 영역임을 명시해주십시오.
+            </div>
+        """, unsafe_allow_html=True)
+            
+        st.markdown("</div>", unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
