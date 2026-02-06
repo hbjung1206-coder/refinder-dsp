@@ -1,12 +1,15 @@
 import streamlit as st
 import librosa
+import librosa.display
 import numpy as np
 import scipy.signal
 import scipy.fft
-import soundfile as sf  # For Metadata Extraction
+import soundfile as sf
 import tempfile
 import os
 import gc
+import matplotlib.pyplot as plt
+import io
 
 # ==============================================================================
 # MODULE 1: DSP KERNEL
@@ -16,8 +19,11 @@ class MasteringDSP:
     @staticmethod
     def load_audio(file_path):
         try:
-            # Librosa loads FLAC natively if soundfile is installed
-            y, sr = librosa.load(file_path, sr=44100, mono=False, duration=180)
+            duration = librosa.get_duration(path=file_path)
+            # Intro Skip Logic (Analyze main part)
+            start_time = 30.0 if duration > 40.0 else 0.0
+            
+            y, sr = librosa.load(file_path, sr=44100, mono=False, offset=start_time, duration=180)
             if y.ndim == 1: y = np.stack((y, y))
             return y, sr
         except Exception as e:
@@ -25,25 +31,15 @@ class MasteringDSP:
 
     @staticmethod
     def get_file_metadata(file_path):
-        """
-        Extracts Sample Rate and Bit Depth/Format info directly from the file header.
-        """
         try:
             with sf.SoundFile(file_path) as f:
                 sr = f.samplerate
                 subtype = f.subtype
                 fmt = f.format
-                
-                # Bit Depth Analysis
-                if 'PCM' in subtype:
-                    quality = f"{subtype.split('_')[-1]}-bit INT"
-                elif 'FLOAT' in subtype:
-                    quality = "32-bit FLOAT"
-                elif 'MPEG' in subtype:
-                    quality = "Lossy (MP3)" # MP3 bitrate is hard to get without specific libs, keeps it safe
-                else:
-                    quality = subtype
-                
+                if 'PCM' in subtype: quality = f"{subtype.split('_')[-1]}-bit INT"
+                elif 'FLOAT' in subtype: quality = "32-bit FLOAT"
+                elif 'MPEG' in subtype: quality = "Lossy (MP3)" 
+                else: quality = subtype
                 return sr, quality, fmt
         except Exception:
             return 0, "Unknown", "Unknown"
@@ -68,7 +64,8 @@ class MasteringDSP:
         lufs_approx = -0.691 + 10 * np.log10(mean_power + 1e-9)
         
         plr = true_peak_db - lufs_approx
-        return round(lufs_approx, 1), round(true_peak_db, 1), round(plr, 1)
+        
+        return round(float(lufs_approx), 1), round(float(true_peak_db), 1), round(float(plr), 1)
 
     @staticmethod
     def analyze_stereo_image(y_stereo):
@@ -85,7 +82,7 @@ class MasteringDSP:
         mid_energy = np.sum(mid**2) + 1e-9
         width_percent = (side_energy / (mid_energy + side_energy)) * 100
         
-        return round(correlation, 2), round(width_percent, 1)
+        return round(float(correlation), 2), round(float(width_percent), 1)
 
     @staticmethod
     def analyze_frequency_spectrum(y_stereo, sr):
@@ -104,44 +101,9 @@ class MasteringDSP:
         for name, (f_min, f_max) in bands.items():
             mask = (freqs >= f_min) & (freqs < f_max)
             band_energy = np.sum(spec[mask, :])
-            energy_dist[name] = (band_energy / total_energy) * 100
+            energy_dist[name] = float((band_energy / total_energy) * 100)
             
         return energy_dist
-
-    @staticmethod
-    def analyze_precision_rhythm(y_stereo, sr):
-        y_mono = librosa.to_mono(y_stereo)
-        _, y_perc = librosa.effects.hpss(y_mono, margin=3.0)
-        onset_env = librosa.util.normalize(librosa.onset.onset_strength(y=y_perc, sr=sr, aggregate=np.median))
-        
-        bpms = np.arange(60, 185, 0.5)
-        fs_frame = sr / 512
-        n = len(onset_env)
-        f = scipy.fft.rfft(onset_env, n=2*n)
-        autocorr = scipy.fft.irfft(f * np.conj(f))[:n]
-        
-        scores = []
-        for bpm in bpms:
-            tau = (60.0 / bpm) * fs_frame
-            period = int(round(tau))
-            score = 0
-            count = 0
-            for m in [1, 2, 4]:
-                idx = period * m
-                if idx < len(autocorr):
-                    score += autocorr[idx]
-                    count += 1
-            scores.append(score / (count if count else 1))
-            
-        scores = np.array(scores)
-        weighting = np.exp(-0.5 * ((bpms - 120) / 50) ** 2)
-        best_bpm = bpms[np.argmax(scores * weighting)]
-        
-        tempogram = librosa.feature.tempogram(onset_envelope=onset_env, sr=sr)
-        stability = 1.0 - np.mean(np.std(tempogram, axis=0))
-        groove = int(stability * 100)
-        
-        return round(best_bpm), groove
 
     @staticmethod
     def analyze_musical_key(y_stereo, sr):
@@ -168,30 +130,51 @@ class MasteringDSP:
                 
         return best_key
 
+    @staticmethod
+    def generate_spectrogram(y_stereo, sr):
+        y_mono = librosa.to_mono(y_stereo)
+        if len(y_mono) > sr * 30: 
+            y_vis = y_mono[:sr*30] 
+        else:
+            y_vis = y_mono
+            
+        D = librosa.amplitude_to_db(np.abs(librosa.stft(y_vis)), ref=np.max)
+        
+        plt.figure(figsize=(10, 3), facecolor='none') 
+        ax = plt.axes()
+        ax.set_facecolor('none')
+        
+        librosa.display.specshow(D, sr=sr, x_axis='time', y_axis='log', cmap='ocean', ax=ax)
+        
+        plt.axis('off')
+        plt.tight_layout(pad=0)
+        
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight', pad_inches=0, transparent=True)
+        plt.close()
+        buf.seek(0)
+        return buf
+
 # ==============================================================================
-# MODULE 2: AI ADVISER & MATRIX ENGINE
+# MODULE 2: AI ADVISER (KOREAN V1.5)
 # ==============================================================================
 
 class AIAdviser:
     @staticmethod
     def generate_report(data):
         advice_list = []
-        
-        # 1. Loudness Check (Simple)
         if data['lufs'] > -7:
             advice_list.append(("WARN", "High Loudness Level", "음압이 매우 높습니다(-7 LUFS 초과). 클럽/CD 마스터링 의도가 아니라면 다이내믹 레인지 손실을 체크하세요."))
         else:
             advice_list.append(("PASS", "Safe Loudness Range", "다이내믹 레인지가 보존된 안전한 음압 범위 내에 있습니다."))
 
-        # 3. Stereo Phase Check
         if data['corr'] < 0.2:
-            advice_list.append(("CRIT", "Phase Cancellation Risk", "위상 상관도가 낮아 모노 호환성에 문제가 발생할 수 있습니다. 저음역대(Kick/Bass)의 모노 센터링을 확인하세요."))
+            advice_list.append(("CRIT", "Phase Cancellation Risk", "위상 상관도가 낮습니다. 모노 환경(스마트폰 등)에서 소리가 사라질 수 있습니다."))
         elif data['corr'] < 0.6:
-            advice_list.append(("INFO", "Wide Stereo Image", "넓은 스테레오 이미지를 가지고 있습니다. 의도된 공간감인지, 위상 간섭인지 확인이 필요합니다."))
+            advice_list.append(("INFO", "Wide Stereo Image", "넓은 스테레오 이미지를 가지고 있습니다."))
         else:
             advice_list.append(("PASS", "Solid Phase Coherence", "위상 호환성이 좋으며 단단한 믹스 밸런스를 유지하고 있습니다."))
 
-        # 4. Frequency Balance Check
         sub_energy = data['freq']['SUB']
         air_energy = data['freq']['AIR']
         
@@ -207,12 +190,10 @@ class AIAdviser:
 
     @staticmethod
     def generate_matrix(data):
-        # 1. DYNAMICS (PLR)
         if data['plr'] < 8: d_val = "COMPRESSED"
         elif data['plr'] > 14: d_val = "DYNAMIC"
         else: d_val = "BALANCED"
 
-        # 2. TONE (Spectral)
         sub = data['freq']['SUB']
         air = data['freq']['AIR']
         if sub > 25: t_val = "BOOMY / DEEP"
@@ -220,13 +201,11 @@ class AIAdviser:
         elif sub < 10 and air < 8: t_val = "MID-FOCUSED"
         else: t_val = "NEUTRAL"
 
-        # 3. IMAGE
         corr = data['corr']
         if corr < 0.3: i_val = "PHASE ISSUE"
         elif corr < 0.6: i_val = "WIDE"
         else: i_val = "CENTERED"
         
-        # 4. LOUDNESS
         lufs = data['lufs']
         if lufs > -9: l_val = "LOUD / CD"
         elif lufs < -16: l_val = "GENTLE"
@@ -239,110 +218,204 @@ class AIAdviser:
 # ==============================================================================
 
 def run_analysis_pipeline(file_path):
-    # Extract Metadata First
     meta_sr, meta_quality, meta_fmt = MasteringDSP.get_file_metadata(file_path)
-    
-    # Load for DSP
     y, sr = MasteringDSP.load_audio(file_path)
     
     try:
         lufs, true_peak, plr = MasteringDSP.analyze_loudness_dynamics(y, sr)
         corr, width = MasteringDSP.analyze_stereo_image(y)
         freq_dist = MasteringDSP.analyze_frequency_spectrum(y, sr)
-        bpm, groove = MasteringDSP.analyze_precision_rhythm(y, sr)
         key = MasteringDSP.analyze_musical_key(y, sr)
+        spec_img = MasteringDSP.generate_spectrogram(y, sr)
         
         data = {
             "lufs": lufs, "true_peak": true_peak, "plr": plr,
             "corr": corr, "width": width,
             "freq": freq_dist,
-            "bpm": bpm, "groove": groove, "key": key,
-            "meta": {"sr": meta_sr, "quality": meta_quality, "fmt": meta_fmt}
+            "key": key,
+            "meta": {"sr": meta_sr, "quality": meta_quality, "fmt": meta_fmt},
+            "spec_img": spec_img
         }
         
         report = AIAdviser.generate_report(data)
         matrix = AIAdviser.generate_matrix(data)
-        
         return data, report, matrix
-        
     finally:
         del y
         gc.collect()
 
 # ==============================================================================
-# MODULE 4: DASHBOARD UI
+# MODULE 4: DASHBOARD UI (iOS Pastel Mint + KOREAN TEXT)
 # ==============================================================================
 
 def configure_ui():
     st.set_page_config(page_title="Re:finder Pro", page_icon="🎚️", layout="wide")
     st.markdown("""
     <style>
-        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;600;800&display=swap');
-        html, body, [class*="css"] {
-            font-family: 'Inter', sans-serif;
-            background: radial-gradient(circle at top left, #1a1a2e 0%, #0a0a0a 100%);
-            color: #E0E0E0;
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Inter:wght@200;300;400;500;600;700;800&display=swap');
+        
+        :root {
+            --mint-primary: #4FD1C5;
+            --mint-secondary: #81F7E5;
+            --mint-glow: rgba(79, 209, 197, 0.5);
+            --glass-bg: rgba(255, 255, 255, 0.03);
+            --glass-border: rgba(79, 209, 197, 0.15);
+            --text-main: #F5F5F7;
+            --text-sub: #86868b;
+            --bg-deep: #0a0f12;
         }
-        .app-title { font-size: 3.5rem; font-weight: 900; letter-spacing: -2px; color: #FFF; margin:0; text-shadow: 0 0 20px rgba(0, 188, 212, 0.3); }
-        .app-subtitle { font-family: 'JetBrains Mono'; font-size: 0.9rem; color: #00bcd4; margin-bottom: 40px; letter-spacing: 2px; text-transform: uppercase; font-weight: 700; }
-        
-        .panel {
-            background: rgba(25, 25, 35, 0.7); backdrop-filter: blur(12px);
-            border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 12px; padding: 25px; margin-bottom: 20px; height: 100%;
-            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3); transition: all 0.3s ease;
-        }
-        .panel:hover { border-color: rgba(0, 188, 212, 0.4); box-shadow: 0 15px 40px rgba(0, 188, 212, 0.1); transform: translateY(-3px); }
-        .panel-header { font-family: 'JetBrains Mono'; font-size: 0.8rem; color: #888; text-transform: uppercase; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 10px; margin-bottom: 20px; letter-spacing: 1px; font-weight: 600; }
-        
-        .big-val { font-size: 3.2rem; font-weight: 900; color: #FFF; line-height: 1; letter-spacing: -1.5px; text-shadow: 0 0 10px rgba(255, 255, 255, 0.2); }
-        .unit { font-size: 1.1rem; color: #666; font-weight: 500; margin-left: 5px; }
-        .sub-metric { font-family: 'JetBrains Mono'; font-size: 0.85rem; color: #AAA; margin-top: 10px; display: flex; align-items: center; }
-        
-        /* Tech Specs */
-        .specs-bar { display: flex; justify-content: space-between; align-items: center; background: rgba(0, 188, 212, 0.1); border: 1px solid rgba(0, 188, 212, 0.3); border-radius: 8px; padding: 12px 20px; margin-bottom: 20px; font-family: 'JetBrains Mono'; color: #00bcd4; }
-        .specs-label { font-weight: 700; margin-right: 10px; }
-        .specs-val { color: #FFF; margin-right: 20px; }
-        
-        /* Spectrum */
-        .freq-row { display: flex; align-items: center; margin-bottom: 12px; font-family: 'JetBrains Mono'; font-size: 0.8rem; }
-        .freq-label { width: 65px; color: #888; font-weight: 600; }
-        .freq-bar-bg { flex-grow: 1; height: 10px; background: rgba(0, 0, 0, 0.3); border-radius: 5px; overflow: hidden; margin: 0 15px; box-shadow: inset 0 2px 5px rgba(0,0,0,0.5); }
-        .freq-bar-fill { height: 100%; border-radius: 5px; background: linear-gradient(90deg, #00bcd4, #7b1fa2); box-shadow: 0 0 15px rgba(0, 188, 212, 0.6); transition: width 0.6s ease; }
-        .freq-val { width: 45px; text-align: right; color: #FFF; font-weight: 700; }
-        
-        /* Report Cards */
-        .report-card { background: rgba(30, 30, 40, 0.6); border-left: 4px solid #555; padding: 15px; margin-bottom: 10px; border-radius: 8px; backdrop-filter: blur(5px); }
-        .report-PASS { border-left-color: #00e676; background: linear-gradient(90deg, rgba(0,230,118,0.1), transparent); }
-        .report-WARN { border-left-color: #ffea00; background: linear-gradient(90deg, rgba(255,234,0,0.1), transparent); }
-        .report-CRIT { border-left-color: #ff1744; background: linear-gradient(90deg, rgba(255,23,68,0.1), transparent); }
-        .report-INFO { border-left-color: #2979ff; background: linear-gradient(90deg, rgba(41,121,255,0.1), transparent); }
-        .report-title { font-weight: 800; color: #FFF; font-size: 0.95rem; margin-bottom: 6px; display: flex; align-items: center; }
-        .report-msg { font-size: 0.9rem; color: #CCC; line-height: 1.5; }
-        .status-icon { margin-right: 10px; font-size: 1.2rem; }
-        
-        /* Matrix Box */
-        .matrix-box { text-align: center; padding: 15px 10px; border-radius: 8px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.05); }
-        .matrix-label { font-family: 'JetBrains Mono'; font-size: 0.75rem; color: #00bcd4; margin-bottom: 8px; letter-spacing: 1px; font-weight: 700; }
-        .matrix-val { font-size: 1.2rem; font-weight: 900; color: #FFF; margin-bottom: 6px; }
-        .matrix-sub { font-size: 0.7rem; color: #666; font-family: 'JetBrains Mono'; font-style: italic; }
-        
-        /* Disclaimer */
-        .disclaimer { font-family: 'Inter', sans-serif; font-size: 0.8rem; color: #666; text-align: center; margin-top: 20px; border-top: 1px solid #333; padding-top: 20px; }
 
-        div.stButton > button { background: linear-gradient(45deg, #00bcd4, #0097a7); color: #FFF; width: 100%; border: none; padding: 18px; font-weight: 800; border-radius: 8px; font-family: 'JetBrains Mono'; letter-spacing: 1px; box-shadow: 0 5px 20px rgba(0, 188, 212, 0.3); transition: all 0.3s ease; }
-        div.stButton > button:hover { box-shadow: 0 8px 25px rgba(0, 188, 212, 0.5); transform: translateY(-2px); }
+        html, body, [class*="css"] {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: radial-gradient(circle at 20% 20%, rgba(26, 188, 156, 0.15) 0%, rgba(10, 15, 20, 0) 50%),
+                        radial-gradient(circle at 80% 80%, rgba(79, 209, 197, 0.1) 0%, rgba(10, 15, 20, 0) 50%),
+                        #0a0f12;
+            color: var(--text-main);
+            scroll-behavior: smooth;
+        }
+        
+        /* TYPOGRAPHY */
+        .app-title { font-size: 3.5rem; font-weight: 800; letter-spacing: -1.5px; color: var(--text-main); margin:0; }
+        .app-subtitle { font-family: 'JetBrains Mono'; font-size: 0.85rem; color: var(--mint-primary); letter-spacing: 1.5px; text-transform: uppercase; font-weight: 600; display: flex; align-items: center; }
+        .app-subtitle::before { content: ''; display: inline-block; width: 8px; height: 8px; background: var(--mint-primary); border-radius: 50%; margin-right: 10px; box-shadow: 0 0 10px var(--mint-primary); }
+
+        /* HEADER LAYOUT */
+        .header-container { display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 40px; padding-top: 20px; }
+        .guide-text { font-family: 'Inter'; font-size: 0.85rem; color: var(--text-main); text-align: right; line-height: 1.5; }
+        .guide-sub { font-family: 'Inter'; font-size: 0.7rem; color: var(--mint-primary); text-align: right; opacity: 0.8; margin-top: 4px; }
+
+        /* iOS GLASSMORPHISM PANELS */
+        .panel {
+            background: var(--glass-bg);
+            backdrop-filter: blur(30px) saturate(150%);
+            -webkit-backdrop-filter: blur(30px) saturate(150%);
+            border: 1px solid var(--glass-border);
+            border-radius: 28px;
+            padding: 24px;
+            margin-bottom: 24px;
+            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.2);
+            transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+        }
+        .panel:hover {
+            border-color: rgba(79, 209, 197, 0.3);
+            box-shadow: 0 12px 40px rgba(79, 209, 197, 0.1);
+            transform: translateY(-2px);
+        }
+        
+        .panel-header {
+            font-family: 'Inter'; font-size: 0.8rem; color: var(--text-sub); text-transform: uppercase;
+            letter-spacing: 1px; font-weight: 600; display: flex; align-items: center; margin-bottom: 15px;
+        }
+        
+        /* TOOLTIPS */
+        .tooltip { position: relative; display: inline-block; cursor: help; color: var(--mint-primary); border-bottom: 1px dotted var(--mint-primary); transition: all 0.3s; }
+        .tooltip:hover { color: var(--mint-secondary); border-bottom-style: solid; }
+        .tooltip .tooltiptext {
+            visibility: hidden; width: 260px; background-color: rgba(20, 25, 30, 0.95); color: var(--text-main); text-align: left;
+            border-radius: 16px; padding: 15px; position: absolute; z-index: 100;
+            bottom: 135%; left: 50%; margin-left: -130px; opacity: 0; transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+            font-family: 'Inter', sans-serif; font-size: 0.8rem; font-weight: 400; line-height: 1.5;
+            border: 1px solid var(--glass-border); box-shadow: 0 10px 30px rgba(0,0,0,0.5); text-transform: none;
+            backdrop-filter: blur(10px);
+        }
+        .tooltip:hover .tooltiptext { visibility: visible; opacity: 1; transform: translateY(0); }
+        
+        /* METRICS */
+        .big-val { font-size: 3.2rem; font-weight: 200; color: var(--text-main); line-height: 1; letter-spacing: -1px; }
+        .unit { font-size: 1.0rem; color: var(--text-sub); font-weight: 400; margin-left: 6px; }
+        .sub-metric { font-family: 'Inter'; font-size: 0.85rem; color: var(--text-sub); margin-top: 12px; display: flex; align-items: center; font-weight: 500; }
+        .sub-metric i { color: var(--mint-primary); margin-right: 8px; font-size: 0.7rem; }
+        
+        /* FREQUENCY BARS */
+        .freq-row { display: flex; align-items: center; margin-bottom: 10px; font-family: 'JetBrains Mono'; font-size: 0.75rem; }
+        .freq-label { width: 55px; color: var(--text-sub); font-weight: 600; }
+        .freq-bar-bg { flex-grow: 1; height: 8px; background: rgba(255,255,255,0.05); border-radius: 4px; overflow: hidden; margin: 0 12px; box-shadow: inset 0 1px 3px rgba(0,0,0,0.3); }
+        .freq-bar-fill {
+            height: 100%; border-radius: 4px;
+            background: linear-gradient(90deg, var(--mint-primary), var(--mint-secondary));
+            box-shadow: 0 0 10px var(--mint-glow);
+            transition: width 0.5s ease-out;
+        }
+        .freq-val { width: 40px; text-align: right; color: var(--text-main); font-weight: 700; }
+        
+        /* REPORTS */
+        .report-card { background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.05); border-left-width: 4px; padding: 12px 15px; margin-bottom: 8px; border-radius: 12px; }
+        .report-title { font-weight: 600; color: var(--text-main); font-size: 0.9rem; margin-bottom: 4px; }
+        .report-msg { font-size: 0.85rem; color: var(--text-sub); line-height: 1.4; }
+        .report-PASS { border-left-color: var(--mint-secondary); background: linear-gradient(90deg, rgba(79, 209, 197, 0.05), transparent); }
+        .report-WARN { border-left-color: #FFD54F; }
+        .report-CRIT { border-left-color: #FF5252; }
+        .report-INFO { border-left-color: #448AFF; }
+        
+        .matrix-box { text-align: center; padding: 18px 10px; border-radius: 20px; background: rgba(255,255,255,0.02); border: 1px solid var(--glass-border); transition: all 0.3s; }
+        .matrix-box:hover { background: rgba(79, 209, 197, 0.05); border-color: var(--mint-primary); }
+        .matrix-label { font-family: 'Inter'; font-size: 0.7rem; color: var(--mint-primary); margin-bottom: 8px; letter-spacing: 1px; font-weight: 700; text-transform: uppercase; }
+        .matrix-val { font-size: 1.1rem; font-weight: 700; color: var(--text-main); margin-bottom: 4px; }
+        .matrix-sub { font-family: 'Inter'; font-size: 0.7rem; color: var(--text-sub); }
+        
+        /* HISTORY */
+        .history-box {
+            background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.05);
+            padding: 15px 20px; border-radius: 16px; margin-bottom: 10px; display: flex; align-items: center; justify-content: space-between; transition: all 0.2s;
+        }
+        .history-box:hover { border-color: var(--mint-primary); background: rgba(79, 209, 197, 0.03); }
+        .history-idx { font-family: 'JetBrains Mono'; color: var(--text-sub); font-size: 1.0rem; font-weight: 700; margin-right: 15px; opacity: 0.5; }
+        .history-name { font-weight: 600; color: var(--text-main); font-size: 0.95rem; margin-bottom: 4px; }
+        .history-meta { font-family: 'Inter'; font-size: 0.75rem; color: var(--text-sub); font-weight: 500; }
+        .history-val { color: var(--mint-primary); font-weight: 600; margin-left: 6px; }
+
+        .disclaimer { font-family: 'Inter', sans-serif; font-size: 0.75rem; color: var(--text-sub); text-align: center; margin-top: 30px; padding-top: 20px; border-top: 1px solid rgba(255,255,255,0.05); opacity: 0.7; }
+
+        /* BUTTONS */
+        div.stButton > button {
+            background: rgba(79, 209, 197, 0.15);
+            color: var(--mint-primary);
+            width: 100%; border: 1px solid rgba(79, 209, 197, 0.3);
+            padding: 18px; font-weight: 700; border-radius: 16px;
+            font-family: 'Inter'; letter-spacing: 0.5px;
+            backdrop-filter: blur(10px);
+            transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+        }
+        div.stButton > button:hover {
+            background: var(--mint-primary);
+            color: #0a0f12;
+            border-color: var(--mint-secondary);
+            box-shadow: 0 0 20px var(--mint-glow);
+            transform: scale(1.02);
+        }
+        .stFileUploader label { font-family: 'Inter'; font-weight: 500; color: var(--mint-primary); }
+        
+        .small-btn button {
+            padding: 8px 16px !important; font-size: 0.75rem !important; width: auto !important;
+            background: rgba(255,255,255,0.05) !important; border: 1px solid rgba(255,255,255,0.1) !important; color: var(--text-sub) !important;
+            border-radius: 12px !important;
+        }
+        .small-btn button:hover {
+            background: var(--mint-primary) !important; color: #0a0f12 !important; border-color: var(--mint-primary) !important;
+        }
     </style>
     """, unsafe_allow_html=True)
 
 def main():
     configure_ui()
     
-    st.markdown('<div class="app-title">Re:finder</div>', unsafe_allow_html=True)
-    st.markdown('<div class="app-subtitle">/// MASTERING GRADE DSP & AI DIAGNOSTICS</div>', unsafe_allow_html=True)
+    # CUSTOM HEADER WITH FLEXBOX FOR GUIDE
+    st.markdown("""
+    <div class="header-container">
+        <div>
+            <div class="app-title">Re:finder</div>
+            <div class="app-subtitle">AI & DSP Diagnostics for Everyone who makes Music</div>
+        </div>
+        <div>
+            <div class="guide-text">완성된 곡을 여기에 올려주세요.<br>나머지는 AI가 분석합니다.</div>
+            <div class="guide-sub">* 지속적으로 업데이트 예정입니다.</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
+    if 'history' not in st.session_state: st.session_state['history'] = []
     if 'last_file_id' not in st.session_state: st.session_state['last_file_id'] = None
     
-    # Updated File Uploader with FLAC
     uploaded_file = st.file_uploader("DROP AUDIO MASTER (WAV/MP3/FLAC)", type=["mp3", "wav", "flac"])
     
     if uploaded_file:
@@ -364,7 +437,10 @@ def main():
                 with st.spinner("PROCESSING SIGNAL CHAIN..."):
                     try:
                         data, report, matrix = run_analysis_pipeline(tmp_path)
-                        st.session_state['result'] = {"data": data, "report": report, "matrix": matrix, "filename": uploaded_file.name}
+                        full_snapshot = {"data": data, "report": report, "matrix": matrix, "filename": uploaded_file.name}
+                        st.session_state['result'] = full_snapshot
+                        st.session_state['history'].append(full_snapshot)
+                        if len(st.session_state['history']) > 5: st.session_state['history'].pop(0)
                         st.rerun()
                     except Exception as e:
                         st.error(f"Error: {e}")
@@ -376,7 +452,7 @@ def main():
             st.session_state['result'] = None
             st.rerun()
 
-    # --- RESULTS DASHBOARD ---
+    # --- MAIN DASHBOARD ---
     if st.session_state.get('result'):
         d = st.session_state['result']['data']
         report = st.session_state['result']['report']
@@ -384,56 +460,77 @@ def main():
         fname = st.session_state['result'].get('filename', 'Unknown Track')
         
         st.write("")
-        st.markdown("---")
         st.write("")
         
-        # ROW 0: FILE TECH SPECS (NEW)
+        # FILE INFO PANEL
         st.markdown(f"""
-        <div class="specs-bar">
-            <div><span class="specs-label">FILE:</span> <span class="specs-val">{fname}</span></div>
-            <div>
-                <span class="specs-label">SAMPLE RATE:</span> <span class="specs-val">{d['meta']['sr']} Hz</span>
-                <span class="specs-label">QUALITY:</span> <span class="specs-val">{d['meta']['quality']}</span>
+        <div class="panel" style="padding: 18px 24px;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <div style="display:flex; align-items:center;">
+                    <div style="width:40px; height:40px; background:rgba(79, 209, 197, 0.1); border-radius:12px; display:flex; align-items:center; justify-content:center; margin-right:15px;">
+                        <span style="font-size:1.2rem;">🎵</span>
+                    </div>
+                    <div>
+                        <div style="font-family:'Inter'; font-size:0.75rem; color:var(--text-sub); font-weight:600; margin-bottom:2px;">FILE NAME</div>
+                        <div style="color:var(--text-main); font-weight:700; font-size:1.0rem; word-break: break-all;">{fname}</div>
+                    </div>
+                </div>
+                <div style="text-align: right;">
+                    <div style="font-family:'Inter'; font-size:0.75rem; color:var(--text-sub); font-weight:600; margin-bottom:2px;">FORMAT</div>
+                    <div style="font-family:'Inter'; color:var(--mint-primary); font-weight:700; font-size:0.9rem;">{d['meta']['sr']}Hz / {d['meta']['quality'].split('-')[0]}bit</div>
+                </div>
             </div>
         </div>
         """, unsafe_allow_html=True)
         
-        # ROW 1: CORE METRICS
         c1, c2, c3 = st.columns([1, 1, 1])
         with c1:
             st.markdown(f"""
             <div class="panel">
-                <div class="panel-header">LOUDNESS</div>
+                <div class="panel-header">
+                    <div class="tooltip">LOUDNESS<span class="tooltiptext"><b>음압(Loudness)</b><br>곡의 평균적인 볼륨입니다. 상업 음원은 보통 -14 ~ -6 LUFS 사이입니다. 너무 낮으면 작게 들리고, 너무 높으면 소리가 찌그러집니다.</span></div>
+                </div>
                 <div class="big-val">{d['lufs']} <span class="unit">LUFS</span></div>
-                <div class="sub-metric"><i>▶</i> TRUE PEAK: {d['true_peak']} dBTP</div>
+                <div class="sub-metric"><i>●</i> TRUE PEAK: {d['true_peak']} dBTP</div>
             </div>""", unsafe_allow_html=True)
         with c2:
             st.markdown(f"""
             <div class="panel">
-                <div class="panel-header">STEREO IMAGE</div>
+                <div class="panel-header">
+                    <div class="tooltip">STEREO IMAGE<span class="tooltiptext"><b>스테레오 이미지(Stereo)</b><br>소리의 좌우 넓이와 위상입니다. Correlation이 +1이면 정중앙(모노), 0이면 넓음, -1이면 소리가 사라질 위험(역위상)이 있습니다.</span></div>
+                </div>
                 <div class="big-val">{d['corr']} <span class="unit">CORR</span></div>
-                <div class="sub-metric"><i>▶</i> WIDTH: {d['width']}%</div>
+                <div class="sub-metric"><i>●</i> WIDTH: {d['width']}%</div>
             </div>""", unsafe_allow_html=True)
         with c3:
             st.markdown(f"""
             <div class="panel">
-                <div class="panel-header">MUSICALITY</div>
-                <div class="big-val">{d['bpm']} <span class="unit">BPM</span></div>
-                <div class="sub-metric"><i>▶</i> KEY: {d['key']}</div>
+                <div class="panel-header">
+                    <div class="tooltip">MUSICALITY<span class="tooltiptext"><b>조성(Key)</b><br>이 곡의 중심이 되는 음계입니다. 오토튠이나 배음 제어 플러그인을 사용할 때 이 키를 설정해야 불협화음을 막을 수 있습니다.</span></div>
+                </div>
+                <div class="big-val" style="font-weight:300;">{d['key']}</div>
+                <div class="sub-metric"><i>●</i> KEY DETECTION</div>
             </div>""", unsafe_allow_html=True)
             
-        # ROW 2: SPECTRUM & AI REPORT
         c_spec, c_report = st.columns([1, 1])
-        
         with c_spec:
+            st.markdown("""
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="tooltip">SPECTRAL BALANCE<span class="tooltiptext"><b>주파수 밸런스</b><br>저음(BASS)부터 고음(AIR)까지 소리의 에너지가 어떻게 분포되어 있는지 보여줍니다.</span></div>
+                </div>
+            """, unsafe_allow_html=True)
+            
+            st.image(d['spec_img'], width="stretch")
+            
             st.markdown(f"""
-            <div class="panel" style="height:100%">
-                <div class="panel-header">SPECTRAL BALANCE</div>
-                <div class="freq-row"><div class="freq-label">AIR</div><div class="freq-bar-bg"><div class="freq-bar-fill" style="width:{d['freq']['AIR']}%;"></div></div><div class="freq-val">{int(d['freq']['AIR'])}%</div></div>
-                <div class="freq-row"><div class="freq-label">HI-MID</div><div class="freq-bar-bg"><div class="freq-bar-fill" style="width:{d['freq']['HIGH_MID']}%;"></div></div><div class="freq-val">{int(d['freq']['HIGH_MID'])}%</div></div>
-                <div class="freq-row"><div class="freq-label">LO-MID</div><div class="freq-bar-bg"><div class="freq-bar-fill" style="width:{d['freq']['LOW_MID']}%;"></div></div><div class="freq-val">{int(d['freq']['LOW_MID'])}%</div></div>
-                <div class="freq-row"><div class="freq-label">BASS</div><div class="freq-bar-bg"><div class="freq-bar-fill" style="width:{d['freq']['BASS']}%;"></div></div><div class="freq-val">{int(d['freq']['BASS'])}%</div></div>
-                <div class="freq-row"><div class="freq-label">SUB</div><div class="freq-bar-bg"><div class="freq-bar-fill" style="width:{d['freq']['SUB']}%;"></div></div><div class="freq-val">{int(d['freq']['SUB'])}%</div></div>
+                <div style="margin-top:20px;">
+                    <div class="freq-row"><div class="freq-label">AIR</div><div class="freq-bar-bg"><div class="freq-bar-fill" style="width:{d['freq']['AIR']}%;"></div></div><div class="freq-val">{int(d['freq']['AIR'])}%</div></div>
+                    <div class="freq-row"><div class="freq-label">HI-MID</div><div class="freq-bar-bg"><div class="freq-bar-fill" style="width:{d['freq']['HIGH_MID']}%;"></div></div><div class="freq-val">{int(d['freq']['HIGH_MID'])}%</div></div>
+                    <div class="freq-row"><div class="freq-label">LO-MID</div><div class="freq-bar-bg"><div class="freq-bar-fill" style="width:{d['freq']['LOW_MID']}%;"></div></div><div class="freq-val">{int(d['freq']['LOW_MID'])}%</div></div>
+                    <div class="freq-row"><div class="freq-label">BASS</div><div class="freq-bar-bg"><div class="freq-bar-fill" style="width:{d['freq']['BASS']}%;"></div></div><div class="freq-val">{int(d['freq']['BASS'])}%</div></div>
+                    <div class="freq-row"><div class="freq-label">SUB</div><div class="freq-bar-bg"><div class="freq-bar-fill" style="width:{d['freq']['SUB']}%;"></div></div><div class="freq-val">{int(d['freq']['SUB'])}%</div></div>
+                </div>
             </div>
             """, unsafe_allow_html=True)
             
@@ -442,62 +539,83 @@ def main():
             <div class="panel" style="height:100%; overflow-y: auto;">
                 <div class="panel-header">🤖 AI DIAGNOSTIC REPORT</div>
             """, unsafe_allow_html=True)
-            
             for status, title, msg in report:
-                icon = "✅" if status == "PASS" else "⚠️" if status == "WARN" else "🛑" if status == "CRIT" else "ℹ️"
+                icon_color = "var(--mint-secondary)" if status == "PASS" else "#FFD54F" if status == "WARN" else "#FF5252" if status == "CRIT" else "#448AFF"
                 st.markdown(f"""
                 <div class="report-card report-{status}">
-                    <div class="report-title"><span class="status-icon">{icon}</span> {title}</div>
+                    <div class="report-title">
+                        <span style="display:inline-block; width:8px; height:8px; border-radius:50%; background:{icon_color}; margin-right:8px;"></span>
+                        {title}
+                    </div>
                     <div class="report-msg">{msg}</div>
                 </div>
                 """, unsafe_allow_html=True)
             st.markdown("</div>", unsafe_allow_html=True)
 
-        # ROW 3: SUMMARY MATRIX & DISCLAIMER
         st.write("")
         st.markdown(f"""
         <div class="panel">
-            <div class="panel-header">📌 AI FEEDBACK SUMMARY (KEY POINTS)</div>
-        """, unsafe_allow_html=True)
-        
-        m1, m2, m3, m4 = st.columns(4)
-        with m1:
-            st.markdown(f"""
-            <div class="matrix-box">
-                <div class="matrix-label">DYNAMICS</div>
-                <div class="matrix-val">{matrix[0]}</div>
-                <div class="matrix-sub">PLR: <8 (Dense) ~ >14 (Dynamic)</div>
-            </div>""", unsafe_allow_html=True)
-        with m2:
-            st.markdown(f"""
-            <div class="matrix-box">
-                <div class="matrix-label">TONAL BALANCE</div>
-                <div class="matrix-val">{matrix[1]}</div>
-                <div class="matrix-sub">Spectrum: Sub-Bass vs Air</div>
-            </div>""", unsafe_allow_html=True)
-        with m3:
-            st.markdown(f"""
-            <div class="matrix-box">
-                <div class="matrix-label">STEREO FIELD</div>
-                <div class="matrix-val">{matrix[2]}</div>
-                <div class="matrix-sub">Corr: <0.3 (Phase) ~ >0.6 (Mono)</div>
-            </div>""", unsafe_allow_html=True)
-        with m4:
-            st.markdown(f"""
-            <div class="matrix-box">
-                <div class="matrix-label">LOUDNESS TYPE</div>
-                <div class="matrix-val">{matrix[3]}</div>
-                <div class="matrix-sub">LUFS: >-9 (Loud) ~ <-16 (Gentle)</div>
-            </div>""", unsafe_allow_html=True)
-        
-        # DISCLAIMER
-        st.markdown("""
-            <div class="disclaimer">
-                Caution: AI로 측정한 수치이며, 오디오는 주관적인 영역임을 명시해주십시오.
+            <div class="panel-header">
+                <div class="tooltip">📌 AI FEEDBACK SUMMARY<span class="tooltiptext"><b>AI 요약</b><br>복잡한 수치들을 한눈에 보기 쉽게 4가지 성향으로 요약했습니다.</span></div>
             </div>
         """, unsafe_allow_html=True)
-            
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
+            st.markdown(f"""<div class="matrix-box"><div class="matrix-label">DYNAMICS</div><div class="matrix-val">{matrix[0]}</div><div class="matrix-sub">PLR: <8 (Dense) ~ >14 (Dynamic)</div></div>""", unsafe_allow_html=True)
+        with m2:
+            st.markdown(f"""<div class="matrix-box"><div class="matrix-label">TONAL BALANCE</div><div class="matrix-val">{matrix[1]}</div><div class="matrix-sub">Spectrum: Sub-Bass vs Air</div></div>""", unsafe_allow_html=True)
+        with m3:
+            st.markdown(f"""<div class="matrix-box"><div class="matrix-label">STEREO FIELD</div><div class="matrix-val">{matrix[2]}</div><div class="matrix-sub">Corr: <0.3 (Phase) ~ >0.6 (Mono)</div></div>""", unsafe_allow_html=True)
+        with m4:
+            st.markdown(f"""<div class="matrix-box"><div class="matrix-label">LOUDNESS TYPE</div><div class="matrix-val">{matrix[3]}</div><div class="matrix-sub">LUFS: >-9 (Loud) ~ <-16 (Gentle)</div></div>""", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
+
+        # --- HISTORY SECTION ---
+        if len(st.session_state['history']) > 0:
+            st.write("")
+            st.write("")
+            st.markdown(f"""
+            <div class="panel">
+                 <div class="panel-header">📋 RECENT ANALYSIS HISTORY (LOAD SNAPSHOT)</div>
+            """, unsafe_allow_html=True)
+            
+            for i, snapshot in enumerate(reversed(st.session_state['history'])):
+                s_name = snapshot['filename']
+                s_lufs = snapshot['data']['lufs']
+                s_plr = snapshot['data']['plr']
+                s_key = snapshot['data']['key']
+                
+                is_active = (s_name == fname) and (d['lufs'] == s_lufs)
+                
+                c_info, c_btn = st.columns([5, 1])
+                with c_info:
+                    active_style = "border-color: var(--mint-primary); background: rgba(79, 209, 197, 0.05);" if is_active else ""
+                    st.markdown(f"""
+                    <div class="history-box" style="{active_style} margin-bottom:0;">
+                        <div style="display:flex; align-items:center;">
+                            <span class="history-idx">#{len(st.session_state['history']) - i}</span>
+                            <div>
+                                <div class="history-name" style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 300px;">{s_name}</div>
+                                <div>
+                                    <span class="history-meta">LUFS <span class="history-val">{s_lufs}</span></span>
+                                    <span class="history-meta" style="margin-left:12px">PLR <span class="history-val">{s_plr}</span></span>
+                                    <span class="history-meta" style="margin-left:12px">KEY <span class="history-val">{s_key}</span></span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                with c_btn:
+                    st.write("")
+                    st.markdown('<div class="small-btn">', unsafe_allow_html=True)
+                    if st.button("LOAD", key=f"load_hist_{i}"):
+                        st.session_state['result'] = snapshot
+                        st.rerun()
+                    st.markdown('</div>', unsafe_allow_html=True)
+
+            st.markdown("</div>", unsafe_allow_html=True)
+            
+        st.markdown("""<div class="disclaimer">Caution: AI로 측정한 수치이며, 오디오는 주관적인 영역임을 명시해주십시오.</div>""", unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
